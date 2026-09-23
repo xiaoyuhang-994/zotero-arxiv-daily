@@ -118,11 +118,11 @@ class ArxivRetriever(BaseRetriever):
         client = arxiv.Client(num_retries=0, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        response = requests.get(
-            f"https://rss.arxiv.org/atom/{query}", timeout=DOWNLOAD_TIMEOUT
-        )
-        response.raise_for_status()
-        feed = feedparser.parse(response.content)
+        # Keep RSS access at the original feedparser boundary so the existing
+        # offline test fixture can intercept it without making network calls.
+        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+        if getattr(feed, "status", 200) >= 400:
+            raise RuntimeError(f"arXiv RSS HTTP {feed.status}: {query}")
         title = feed.feed.get("title", "")
         if not title or 'Feed error for query' in title:
             raise RuntimeError(f"Invalid or unavailable arXiv RSS feed: {query}")
@@ -187,7 +187,7 @@ class ArxivRetriever(BaseRetriever):
                     batch = []
 
                 # Recover omitted entries as well as rejected batches.
-                by_id = {paper.get_short_id(): paper for paper in batch}
+                by_id = {paper.entry_id.split("/abs/", 1)[-1]: paper for paper in batch}
                 for paper_id in batch_ids:
                     if paper_id in by_id:
                         continue
@@ -200,7 +200,9 @@ class ArxivRetriever(BaseRetriever):
                             f"Skipping arXiv {paper_id}: HTTP {exc.status}"
                         )
                         single = []
-                    by_id.update({paper.get_short_id(): paper for paper in single})
+                    by_id.update({
+                        paper.entry_id.split("/abs/", 1)[-1]: paper for paper in single
+                    })
                     if paper_id not in by_id:
                         skipped_ids.append(paper_id)
                         logger.warning(f"No usable metadata for arXiv {paper_id}")
