@@ -114,46 +114,115 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        # Retry only here: avoid multiplying library and application retries.
+        client = arxiv.Client(num_retries=0, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
-        if 'Feed error for query' in feed.feed.title:
-            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
-        allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
-        ]
+        response = requests.get(
+            f"https://rss.arxiv.org/atom/{query}", timeout=DOWNLOAD_TIMEOUT
+        )
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        title = feed.feed.get("title", "")
+        if not title or 'Feed error for query' in title:
+            raise RuntimeError(f"Invalid or unavailable arXiv RSS feed: {query}")
+
+        allowed_types = {"new", "cross"} if include_cross_list else {"new"}
+        all_paper_ids = list(dict.fromkeys(
+            entry.id.removeprefix("oai:arXiv.org:")
+            for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_types
+        ))
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
+        logger.info(f"arXiv RSS candidates: {len(all_paper_ids)}")
+        if not all_paper_ids:
+            return []
 
-        # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
-                        raise
-            if i + 20 < len(all_paper_ids):
+        def fetch(ids: list[str]) -> list[ArxivResult]:
+            for attempt in range(3):
+                # Also separate RSS, batch and single-paper API requests.
                 sleep(3)
-        bar.close()
+                try:
+                    return list(client.results(arxiv.Search(
+                        id_list=ids, max_results=len(ids)
+                    )))
+                except arxiv.HTTPError as exc:
+                    # 406 is handled by the caller. Do not retry it unchanged.
+                    transient = exc.status == 429 or 500 <= exc.status < 600
+                    if not transient or attempt == 2:
+                        raise
+                    delay = 30 * (2 ** attempt)
+                    logger.warning(
+                        f"arXiv HTTP {exc.status}; retry {attempt + 1}/2 "
+                        f"after {delay}s"
+                    )
+                    sleep(delay)
+                except (requests.exceptions.RequestException,
+                        arxiv.UnexpectedEmptyPageError) as exc:
+                    if attempt == 2:
+                        raise
+                    delay = 30 * (2 ** attempt)
+                    logger.warning(
+                        f"arXiv {type(exc).__name__}; retry after {delay}s"
+                    )
+                    sleep(delay)
+            raise RuntimeError("arXiv retry loop exhausted")
 
+        raw_papers = []
+        skipped_ids = []
+        with tqdm(total=len(all_paper_ids), desc="arXiv metadata IDs processed") as bar:
+            for offset in range(0, len(all_paper_ids), 20):
+                batch_ids = all_paper_ids[offset:offset + 20]
+                try:
+                    batch = fetch(batch_ids)
+                except arxiv.HTTPError as exc:
+                    if exc.status != 406:
+                        # Persistent 429/5xx: stop, rather than fan out requests.
+                        raise
+                    logger.warning(
+                        f"arXiv batch HTTP 406; falling back to single-paper "
+                        f"requests for {len(batch_ids)} IDs"
+                    )
+                    batch = []
+
+                # Recover omitted entries as well as rejected batches.
+                by_id = {paper.get_short_id(): paper for paper in batch}
+                for paper_id in batch_ids:
+                    if paper_id in by_id:
+                        continue
+                    try:
+                        single = fetch([paper_id])
+                    except arxiv.HTTPError as exc:
+                        if exc.status not in (404, 406):
+                            raise
+                        logger.warning(
+                            f"Skipping arXiv {paper_id}: HTTP {exc.status}"
+                        )
+                        single = []
+                    by_id.update({paper.get_short_id(): paper for paper in single})
+                    if paper_id not in by_id:
+                        skipped_ids.append(paper_id)
+                        logger.warning(f"No usable metadata for arXiv {paper_id}")
+
+                raw_papers.extend(by_id[pid] for pid in batch_ids if pid in by_id)
+                bar.update(len(batch_ids))
+                # A completely inaccessible first batch likely indicates a
+                # wider service problem; do not send hundreds more requests.
+                if not raw_papers:
+                    raise RuntimeError(
+                        "arXiv returned no usable metadata for the first batch, "
+                        "including single-paper attempts. Stopping; this is "
+                        "not a day with zero new papers."
+                    )
+
+        logger.info(
+            f"arXiv metadata summary: candidates={len(all_paper_ids)}, "
+            f"retrieved={len(raw_papers)}, skipped={len(skipped_ids)}"
+        )
+        if skipped_ids:
+            logger.warning("Recommendation coverage is incomplete. Skipped IDs: "
+                           + ", ".join(skipped_ids))
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
