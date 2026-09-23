@@ -13,6 +13,10 @@ from time import sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
+from dataclasses import dataclass
+from html import unescape
+from html.parser import HTMLParser
+import re
 
 T = TypeVar("T")
 
@@ -106,6 +110,87 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
+
+class _PlainText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("p", "br", "div", "li"):
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in ("p", "div", "li"):
+            self.parts.append(" ")
+
+
+def _rss_text(value) -> str:
+    text = str(value or "")
+    # Atom text abstracts may contain mathematical '<' characters, not HTML.
+    if re.search(r"</?(?:p|div|span|a|br|b|i|em|strong|sub|sup)\b", text, re.I):
+        parser = _PlainText()
+        parser.feed(text)
+        text = "".join(parser.parts)
+    else:
+        text = unescape(text)
+    return " ".join(text.split())
+
+
+def _paper_id(value: str) -> str:
+    value = value.removeprefix("oai:arXiv.org:")
+    return value.split("/abs/", 1)[-1].strip()
+
+
+@dataclass
+class _RSSMetadata:
+    title: str
+    authors: list[str]
+    summary: str
+    entry_id: str
+    pdf_url: str
+
+
+class _RSSSummaryPaper(Paper):
+    def generate_tldr(self, openai_client, llm_params):
+        text = super().generate_tldr(openai_client, llm_params)
+        self.tldr = "【仅基于 RSS 摘要，未读取全文】" + (text or "")
+        return self.tldr
+
+    def generate_affiliations(self, openai_client, llm_params):
+        # RSS does not provide reliable author affiliation information.
+        self.affiliations = None
+        return None
+
+
+def _metadata_from_rss(entry, paper_id: str) -> _RSSMetadata | None:
+    title = _rss_text(entry.get("title", ""))
+    summary = _rss_text(entry.get("summary", "") or entry.get("description", ""))
+    # Official Atom summary begins with an ID/announcement header.
+    if summary.lower().startswith("arxiv:"):
+        pieces = re.split(r"\bAbstract:\s*", summary, maxsplit=1, flags=re.I)
+        summary = pieces[1].strip() if len(pieces) == 2 else ""
+    if not title or not summary:
+        return None
+    author_values = [a.get("name", "") for a in entry.get("authors", [])]
+    if not any(author_values):
+        author_values = [entry.get("author", "") or entry.get("dc_creator", "")]
+    authors = []
+    for value in author_values:
+        for name in _rss_text(value).split(","):
+            name = name.strip()
+            if name and name not in authors:
+                authors.append(name)
+    return _RSSMetadata(
+        title=title, authors=authors, summary=summary,
+        entry_id=f"https://arxiv.org/abs/{paper_id}",
+        pdf_url=f"https://arxiv.org/pdf/{paper_id}",
+    )
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -113,121 +198,90 @@ class ArxivRetriever(BaseRetriever):
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
 
-    def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        # Retry only here: avoid multiplying library and application retries.
+    def _retrieve_raw_papers(self) -> list[ArxivResult | _RSSMetadata]:
+        # On API failure use the already-loaded RSS, without per-ID fan-out.
         client = arxiv.Client(num_retries=0, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
-        include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Keep RSS access at the original feedparser boundary so the existing
-        # offline test fixture can intercept it without making network calls.
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if getattr(feed, "status", 200) >= 400:
             raise RuntimeError(f"arXiv RSS HTTP {feed.status}: {query}")
         title = feed.feed.get("title", "")
-        if not title or 'Feed error for query' in title:
-            raise RuntimeError(f"Invalid or unavailable arXiv RSS feed: {query}")
-
-        allowed_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = list(dict.fromkeys(
-            entry.id.removeprefix("oai:arXiv.org:")
-            for entry in feed.entries
-            if entry.get("arxiv_announce_type", "new") in allowed_types
-        ))
+        if not title or 'Feed error for query' in title or getattr(feed, "bozo", False):
+            raise RuntimeError(f"Invalid or malformed arXiv RSS feed: {query}")
+        allowed_types = {"new", "cross"} if self.config.source.arxiv.get(
+            "include_cross_list", False
+        ) else {"new"}
+        entries_by_id = {}
+        for entry in feed.entries:
+            if entry.get("arxiv_announce_type", "new") not in allowed_types:
+                continue
+            pid = _paper_id(entry.get("id", ""))
+            if not re.fullmatch(r"(?:[0-9]{4}\.[0-9]{4,5}|[A-Za-z.-]+/[0-9]{7})(?:v[0-9]+)?", pid):
+                raise RuntimeError(f"Invalid arXiv ID in RSS: {pid!r}")
+            if pid not in entries_by_id:
+                entries_by_id[pid] = entry
+        ids = list(entries_by_id)
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
-        logger.info(f"arXiv RSS candidates: {len(all_paper_ids)}")
-        if not all_paper_ids:
+            ids = ids[:10]
+        logger.info(f"arXiv RSS candidates: {len(ids)}")
+        if not ids:
             return []
 
-        def fetch(ids: list[str]) -> list[ArxivResult]:
-            for attempt in range(3):
-                # Also separate RSS, batch and single-paper API requests.
-                sleep(3)
-                try:
-                    return list(client.results(arxiv.Search(
-                        id_list=ids, max_results=len(ids)
-                    )))
-                except arxiv.HTTPError as exc:
-                    # 406 is handled by the caller. Do not retry it unchanged.
-                    transient = exc.status == 429 or 500 <= exc.status < 600
-                    if not transient or attempt == 2:
-                        raise
-                    delay = 30 * (2 ** attempt)
-                    logger.warning(
-                        f"arXiv HTTP {exc.status}; retry {attempt + 1}/2 "
-                        f"after {delay}s"
-                    )
-                    sleep(delay)
-                except (requests.exceptions.RequestException,
-                        arxiv.UnexpectedEmptyPageError) as exc:
-                    if attempt == 2:
-                        raise
-                    delay = 30 * (2 ** attempt)
-                    logger.warning(
-                        f"arXiv {type(exc).__name__}; retry after {delay}s"
-                    )
-                    sleep(delay)
-            raise RuntimeError("arXiv retry loop exhausted")
-
         raw_papers = []
-        skipped_ids = []
-        with tqdm(total=len(all_paper_ids), desc="arXiv metadata IDs processed") as bar:
-            for offset in range(0, len(all_paper_ids), 20):
-                batch_ids = all_paper_ids[offset:offset + 20]
-                try:
-                    batch = fetch(batch_ids)
-                except arxiv.HTTPError as exc:
-                    if exc.status != 406:
-                        # Persistent 429/5xx: stop, rather than fan out requests.
-                        raise
-                    logger.warning(
-                        f"arXiv batch HTTP 406; falling back to single-paper "
-                        f"requests for {len(batch_ids)} IDs"
-                    )
-                    batch = []
-
-                # Recover omitted entries as well as rejected batches.
-                by_id = {paper.entry_id.split("/abs/", 1)[-1]: paper for paper in batch}
-                for paper_id in batch_ids:
-                    if paper_id in by_id:
-                        continue
+        api_count = 0
+        rss_count = 0
+        skipped = []
+        api_available = True
+        with tqdm(total=len(ids), desc="arXiv metadata IDs processed") as bar:
+            for offset in range(0, len(ids), 20):
+                batch_ids = ids[offset:offset + 20]
+                batch = []
+                if api_available:
+                    sleep(3)
                     try:
-                        single = fetch([paper_id])
-                    except arxiv.HTTPError as exc:
-                        if exc.status not in (404, 406):
-                            raise
+                        batch = list(client.results(arxiv.Search(
+                            id_list=batch_ids, max_results=len(batch_ids)
+                        )))
+                    except (arxiv.HTTPError, arxiv.UnexpectedEmptyPageError,
+                            requests.exceptions.RequestException) as exc:
+                        api_available = False
                         logger.warning(
-                            f"Skipping arXiv {paper_id}: HTTP {exc.status}"
+                            f"arXiv API unavailable ({type(exc).__name__}, "
+                            f"status={getattr(exc, 'status', 'network/parse')}); "
+                            "using cached RSS metadata for this and remaining "
+                            "batches. No further API requests in this run."
                         )
-                        single = []
-                    by_id.update({
-                        paper.entry_id.split("/abs/", 1)[-1]: paper for paper in single
-                    })
-                    if paper_id not in by_id:
-                        skipped_ids.append(paper_id)
-                        logger.warning(f"No usable metadata for arXiv {paper_id}")
-
-                raw_papers.extend(by_id[pid] for pid in batch_ids if pid in by_id)
+                by_id = {_paper_id(p.entry_id): p for p in batch}
+                for pid in batch_ids:
+                    if pid in by_id:
+                        raw_papers.append(by_id[pid])
+                        api_count += 1
+                    else:
+                        paper = _metadata_from_rss(entries_by_id[pid], pid)
+                        if paper is not None:
+                            raw_papers.append(paper)
+                            rss_count += 1
+                        else:
+                            skipped.append(pid)
+                            logger.warning(f"Skipping {pid}: RSS title or abstract missing")
                 bar.update(len(batch_ids))
-                # A completely inaccessible first batch likely indicates a
-                # wider service problem; do not send hundreds more requests.
-                if not raw_papers:
-                    raise RuntimeError(
-                        "arXiv returned no usable metadata for the first batch, "
-                        "including single-paper attempts. Stopping; this is "
-                        "not a day with zero new papers."
-                    )
-
         logger.info(
-            f"arXiv metadata summary: candidates={len(all_paper_ids)}, "
-            f"retrieved={len(raw_papers)}, skipped={len(skipped_ids)}"
+            f"arXiv metadata summary: candidates={len(ids)}, "
+            f"api={api_count}, rss_fallback={rss_count}, skipped={len(skipped)}"
         )
-        if skipped_ids:
-            logger.warning("Recommendation coverage is incomplete. Skipped IDs: "
-                           + ", ".join(skipped_ids))
+        if not raw_papers:
+            raise RuntimeError("RSS contains candidates but no usable metadata; no email generated.")
+        if skipped:
+            logger.warning("Recommendation coverage incomplete. Skipped IDs: " + ", ".join(skipped))
         return raw_papers
 
-    def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
+    def convert_to_paper(self, raw_paper: ArxivResult | _RSSMetadata) -> Paper:
+        if isinstance(raw_paper, _RSSMetadata):
+            return _RSSSummaryPaper(
+                source=self.name, title=raw_paper.title, authors=raw_paper.authors,
+                abstract=raw_paper.summary, url=raw_paper.entry_id,
+                pdf_url=raw_paper.pdf_url, full_text=None,
+            )
         title = raw_paper.title
         authors = [a.name for a in raw_paper.authors]
         abstract = raw_paper.summary
