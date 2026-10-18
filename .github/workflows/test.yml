@@ -1,20 +1,41 @@
 name: Test
+
 on:
   workflow_dispatch:
+
+
+permissions:
+  contents: read
+
+# Main and Test use the same lock and sent history. Do not cancel an SMTP send.
+concurrency:
+  group: arxiv-digest-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   calculate-and-send:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ZAD_ARXIV_MODE: api_first
+      ZAD_STATE_DIR: ${{ github.workspace }}/.arxiv-state
+      ZAD_DIAGNOSTICS_PATH: ${{ github.workspace }}/arxiv-diagnostics.json
     steps:
-      - name: Checkout
+      - name: Checkout this repository and selected commit
         uses: actions/checkout@v6
-      #  with:
-      #    repository: ${{ vars.REPOSITORY }}
-      #    ref: ${{ vars.REF }}
+
+      - name: Restore sent history
+        uses: actions/cache/restore@v5
+        with:
+          path: .arxiv-state
+          key: arxiv-mail-state-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            arxiv-mail-state-v1-${{ github.ref_name }}-
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v7.1.4
-
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
 
       - name: Run script
         env:
@@ -27,8 +48,20 @@ jobs:
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
         run: |
-          export DEBUG=true
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
-          echo "Use custom config: "
-          cat config/custom.yaml
-          uv run src/zotero_arxiv_daily/main.py
+          uv run src/zotero_arxiv_daily/main.py executor.debug=false
+
+      - name: Show retrieval diagnostics
+        if: always()
+        shell: bash
+        run: |
+          if [ -f arxiv-diagnostics.json ]; then
+            cat arxiv-diagnostics.json
+          fi
+
+      - name: Save sent history
+        if: always() && hashFiles('.arxiv-state/sent.json') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: .arxiv-state
+          key: arxiv-mail-state-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
