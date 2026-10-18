@@ -15,7 +15,7 @@ concurrency:
 jobs:
   calculate-and-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 100
     env:
       ZAD_ARXIV_MODE: api_first
       ZAD_STATE_DIR: ${{ github.workspace }}/.arxiv-state
